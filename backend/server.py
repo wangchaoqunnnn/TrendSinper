@@ -177,10 +177,11 @@ class Handler(BaseHTTPRequestHandler):
         if not path.startswith(root) or not os.path.isfile(path):
             self._send_json({"error": "not found"}, 404)
             return
-        ext = os.path.splitext(path)[1].lower()
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
         ctype = {"html": "text/html; charset=utf-8", "css": "text/css; charset=utf-8",
                  "js": "application/javascript; charset=utf-8", "json": "application/json",
-                 "svg": "image/svg+xml", "png": "image/png", "ico": "image/x-icon"}.get(
+                 "svg": "image/svg+xml", "png": "image/png", "ico": "image/x-icon",
+                 "txt": "text/plain; charset=utf-8"}.get(
                      ext, "application/octet-stream")
         with open(path, "rb") as f:
             data = f.read()
