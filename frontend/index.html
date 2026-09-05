@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TrendSniper · 趋势选股系统</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">📈</span>
+    <div>
+      <h1>TrendSniper <em>趋势选股系统</em></h1>
+      <p class="tagline">自上而下找赛道 · 基本面筛选 · 技术面确认 · 破位坚决跑</p>
+    </div>
+  </div>
+  <div class="top-actions" id="topActions"></div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="picks">今日选股</button>
+  <button class="tab" data-tab="backtest">回测与统计</button>
+  <button class="tab" data-tab="tune">策略自调优</button>
+  <button class="tab" data-tab="paper">虚拟持仓跟踪</button>
+  <button class="tab" data-tab="about">策略说明</button>
+</nav>
+
+<main>
+  <!-- ============ 今日选股 ============ -->
+  <section id="tab-picks" class="tabpage active">
+    <div class="statusbar" id="picksStatus"></div>
+    <div id="picksMeta" class="meta-line"></div>
+    <div class="toolbar">
+      <button class="btn primary" id="btnScreen">⚡ 立即选股</button>
+      <button class="btn" id="btnRefreshQuotes">🔄 刷新现价</button>
+      <span class="hint">选股范围：沪深主板 · 创业板 · 科创板 · 北证</span>
+    </div>
+    <div id="jobProbe"></div>
+    <div id="picksList" class="cards"></div>
+  </section>
+
+  <!-- ============ 回测与统计 ============ -->
+  <section id="tab-backtest" class="tabpage">
+    <div class="statusbar" id="btStatus"></div>
+    <div class="toolbar">
+      <button class="btn primary" id="btnBacktest">▶ 运行回测</button>
+      <span class="hint" id="btVersion"></span>
+    </div>
+    <div id="btStats" class="kpis"></div>
+    <div class="panel">
+      <h3>资金曲线（等权名义仓位，1 单位起始）</h3>
+      <canvas id="equityChart" height="260"></canvas>
+    </div>
+    <div class="grid2">
+      <div class="panel"><h3>按板块统计</h3><div id="btByBoard"></div></div>
+      <div class="panel"><h3>按离场原因统计</h3><div id="btByReason"></div></div>
+    </div>
+    <div class="panel">
+      <h3>最近交易明细（点击表头排序）</h3>
+      <div id="btTrades"></div>
+    </div>
+    <div class="note" id="btCaveat"></div>
+  </section>
+
+  <!-- ============ 策略自调优 ============ -->
+  <section id="tab-tune" class="tabpage">
+    <div class="statusbar" id="tuneStatus"></div>
+    <div class="toolbar">
+      <button class="btn primary" id="btnTune">🔬 立即回测并自调优</button>
+      <span class="hint">系统每周五 20:30 自动执行；调优只在验证窗确认更优时才采纳，防止过拟合</span>
+    </div>
+    <div class="grid2">
+      <div class="panel">
+        <h3>当前策略参数 <span id="paramsVer" class="badge"></span></h3>
+        <div id="paramsView"></div>
+      </div>
+      <div class="panel">
+        <h3>调优历史（回测驱动的自我调整记录）</h3>
+        <div id="tuneHistory"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 虚拟持仓跟踪 ============ -->
+  <section id="tab-paper" class="tabpage">
+    <div class="statusbar" id="paperStatus"></div>
+    <div id="paperStats" class="kpis"></div>
+    <div class="grid2">
+      <div class="panel"><h3>持有中（虚拟跟踪）</h3><div id="paperOpen"></div></div>
+      <div class="panel"><h3>已平仓记录（虚拟盘）</h3><div id="paperClosed"></div></div>
+    </div>
+    <div class="note">虚拟盘以每次选股信号自动开仓，按推荐止损价/破位规则/持有超时自动平仓，
+      用于积累真实的“成功率 / 盈亏比”样本（需要数个交易日才会累积；历史统计请以“回测与统计”页为准）。</div>
+  </section>
+
+  <!-- ============ 策略说明 ============ -->
+  <section id="tab-about" class="tabpage">
+    <div class="panel">
+      <h3>策略文本（项目源文件《趋势策略.md》）</h3>
+      <pre id="strategyText" class="strategy-text"></pre>
+    </div>
+    <div class="panel">
+      <h3>量化映射与统计口径</h3>
+      <div id="mappingDoc"></div>
+    </div>
+  </section>
+</main>
+
+<footer>TrendSniper · 纯本地运行 · 结果仅供研究，不构成投资建议</footer>
+
+<div id="toast" class="toast"></div>
+<script src="js/charts.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+*.log
+
+# 运行时产物（服务器 /root 克隆后首次启动会自动重建，不提交到仓库）
+data/
