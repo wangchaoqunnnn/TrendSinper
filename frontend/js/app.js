@@ -159,11 +159,21 @@ function watchJob(jobId, doneCb) {
 async function loadPicks() {
   const st = G.status;
   if (st) {
+    const m = st.market || {};
+    const outdatedChip = m.outdated
+      ? `<span class="chip warn" style="border-color:rgba(245,196,83,.7)">⏳ 检测到 ${esc(m.last_market_date)} 新行情，系统正在自动更新…</span>`
+      : "";
+    const wdChip = m.is_trading_day === false
+      ? `<span class="chip warn">今日休市（周末/节假日无新行情）</span>` : "";
     $("#picksStatus").innerHTML = `
       <span>数据源：<b class="src">${esc(st.data_source_label)}</b></span>
       <span>策略：<b>${esc(st.params.version)}</b></span>
       <span>最近选股：${esc(st.last_screen || "尚未运行")}</span>
-      <span>入选：<b>${st.picks_count}</b> 只</span>`;
+      <span>入选：<b>${st.picks_count}</b> 只</span>
+      <span>今天：${esc(m.today || "")}</span>
+      <span>最近交易日：<b>${esc(m.last_market_date || "—")}</b></span>
+      ${m.next_auto_at ? `<span class="src">下次自动选股：${esc(m.next_auto_at)}</span>` : ""}
+      ${wdChip}${outdatedChip}`;
   }
   const d = await api("api/picks");
   const meta = d.meta || {};
@@ -173,8 +183,9 @@ async function loadPicks() {
     mt.innerHTML = "尚未生成选股结果 —— 点击右上“⚡ 立即选股”（首次拉取全市场实时行情，约需 1-2 分钟）。";
   } else if (meta.date) {
     const relaxed = meta.relaxed ? `<span class="chip warn">已自动放宽门槛至 ${meta.threshold} 分</span>` : "";
-    mt.innerHTML = `信号日 <b>${esc(meta.date)}</b>（收盘后）· 候选 ${meta.counts.candidate} / 有K线 ${meta.counts.with_kline} 只 · 入选 ${picks.length} 只 ${relaxed}
-      <span class="chip">策略版本 ${esc(meta.params_version || "")}</span>`;
+    mt.innerHTML = `信号日 <b>${esc(meta.date)}</b>（当日收盘后自动生成）· 候选 ${meta.counts.candidate} / 有K线 ${meta.counts.with_kline} 只 · 入选 ${picks.length} 只 ${relaxed}
+      <span class="chip">策略版本 ${esc(meta.params_version || "")}</span>
+      <span class="chip">${esc(G.status && G.status.market && (G.status.market.is_trading_day === false ? "今日休市：显示最近交易日" + (G.status.market.last_market_date || "") + " 收盘结果" : "数据已更新至 " + (G.status.market && G.status.market.last_market_date || meta.date))) }</span>`;
   }
   $("#picksList").innerHTML = picks.length
     ? picks.map(pickCard).join("")
@@ -444,7 +455,25 @@ async function loadAbout() {
 }
 
 /* ---------------- 启动 ---------------- */
+let lastScreenAt = null;
 document.addEventListener("DOMContentLoaded", () => {
   loadAll();
-  setInterval(() => loadStatus(), 60000);
+  setInterval(async () => {
+    if (document.hidden) return;                 // 后台标签页不打扰
+    const before = lastScreenAt;
+    await loadStatus();
+    const st = G.status;
+    const cur = st && st.last_screen;
+    if (before !== null && cur !== before) {
+      // 定时/后台任务刚更新了选股 → 刷新当前页
+      lastScreenAt = cur;
+      const act = $(".tab.active");
+      if (act) act.click();
+      toast("已自动刷新：检测到新选股结果", 2500);
+    } else {
+      lastScreenAt = cur || before;
+      // 停在“今日选股”页时顺带刷新实时现价
+      if ($("#tab-picks").classList.contains("active")) loadPicks();
+    }
+  }, 45000);
 });

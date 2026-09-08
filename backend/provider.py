@@ -7,6 +7,7 @@
   · 个股现价缓存 10 秒（跟踪页快速刷新）；
   · 日K以 SQLite 持久化，命中即不再请求网络；指数在进程内缓存。
 """
+import datetime
 import threading
 import time
 
@@ -48,6 +49,7 @@ class LiveProvider:
         self._quotes = None
         self._quotes_ts = 0.0
         self._index_cache = {}
+        self._index_ts = {}
 
     # ------------------------------------------------------------------
     # 可用性探测
@@ -92,39 +94,71 @@ class LiveProvider:
         return self.snapshot()
 
     # ------------------------------------------------------------------
-    # 个股日K（SQLite 持久化缓存）
+    # 个股日K（SQLite 持久化缓存 + 按交易日增量更新）
     # ------------------------------------------------------------------
     def bars(self, code, deep=False):
-        cached = store.get_bars(code, limit=800)
         need = 620 if deep else 320
+        cached = store.get_bars(code, limit=900)
+        last_date = cached[-1]["date"] if cached else None
+        market_last = self.today_str()
+        # 缓存已覆盖到最近交易日 → 直接返回；否则只增量拉取缺失区间
+        if last_date is None or last_date < market_last:
+            if last_date:
+                try:
+                    d = datetime.date.fromisoformat(last_date)
+                    beg = (d + datetime.timedelta(days=1)).strftime("%Y%m%d")
+                except Exception:  # noqa: BLE001
+                    beg = "20230101" if deep else "20240601"
+            else:
+                beg = "20230101" if deep else "20240601"
+            try:
+                rows = dataapi.fetch_bars(code, beg=beg)
+                store.upsert_bars(code, rows)
+                cached = store.get_bars(code, limit=900)
+            except Exception:  # noqa: BLE001
+                pass
         if len(cached) >= need:
             return cached
-        beg = "20230101" if deep else "20240601"
-        rows = dataapi.fetch_bars(code, beg=beg)
-        store.upsert_bars(code, rows)
-        return store.get_bars(code, limit=800)
+        # 历史不足（新上市等）则拉全量补齐
+        try:
+            rows = dataapi.fetch_bars(code, beg="20230101")
+            store.upsert_bars(code, rows)
+        except Exception:  # noqa: BLE001
+            pass
+        return store.get_bars(code, limit=900)
 
     def codes_with_bars(self, min_bars=130):
         return store.codes_with_bars(min_bars)
 
     # ------------------------------------------------------------------
-    # 基准指数
+    # 基准指数（进程内缓存 600 秒，盘中会自动取到最新）
     # ------------------------------------------------------------------
+    INDEX_TTL = 600
+
     def index_bars(self, code="000300"):
         key = "I" + code
-        if key in self._index_cache:
+        now = time.time()
+        # 缓存有效期内直接返回
+        if key in self._index_cache and now - self._index_ts.get(key, 0) < self.INDEX_TTL:
             return self._index_cache[key]
-        if store.bar_count(key) > 100:
-            rows = store.get_bars(key, limit=900)
+        # 过期/缺失 → 联网取最新；失败才回退本地缓存
+        try:
+            rows = dataapi.fetch_index_bars(code, beg="20230101")
+            rows = [{"date": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4],
+                     "v": r[5], "amount": r[6]} for r in rows]
+            if rows:
+                store.upsert_bars(key, [tuple(r[k] for k in
+                                              ("date", "o", "h", "l", "c", "v", "amount"))
+                                        for r in rows])
+                self._index_cache[key] = rows
+                self._index_ts[key] = now
+                return rows
+        except Exception:  # noqa: BLE001
+            pass
+        rows = store.get_bars(key, limit=900)
+        if rows:
             self._index_cache[key] = rows
-            return rows
-        rows = dataapi.fetch_index_bars(code, beg="20230101")
-        rows = [{"date": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4],
-                 "v": r[5], "amount": r[6]} for r in rows]
-        store.upsert_bars(key, [tuple(r[k] for k in
-                                      ("date", "o", "h", "l", "c", "v", "amount"))
-                                for r in rows])
-        self._index_cache[key] = rows
+            self._index_ts[key] = now
         return rows
 
     # ------------------------------------------------------------------

@@ -176,13 +176,13 @@ DEFAULT_PARAMS = {
         "comment": "评价目标：胜率、盈亏比、每笔期望收益、利润因子的加权综合",
     },
     "schedule": {
-        # “每隔一段时间需要自行回测” —— 定时任务
-        "screen_weekdays": [0, 1, 2, 3, 4],   # 周一~周五收盘后刷新选股
-        "screen_hhmm": "18:10",
+        # “每天都要实时更新”—— 交易日收盘后自动选股 + 启动补跑
+        "screen_weekdays": [0, 1, 2, 3, 4],   # 周一~周五
+        "screen_hhmm": "15:20",               # 收盘后(15:00)取当日完整K线选股
         "backtest_weekdays": [4],              # 每周五晚自动回测+自调优
         "backtest_hhmm": "20:30",
-        "startup_catchup": True,               # 启动时补跑逾期任务
-        "comment": "每日选股；每周五回测；回测驱动参数自调优",
+        "startup_catchup": True,               # 启动时补跑逾期任务（跨天开机自动更新）
+        "comment": "每个交易日收盘后自动刷新选股；停机跨天后启动自动补跑最新交易日",
     },
 }
 

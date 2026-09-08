@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """极简 HTTP 服务：静态前端 + JSON API + 后台任务线程管理（仅标准库）。"""
+import datetime
 import json
 import os
 import re
@@ -30,8 +31,18 @@ class JobManager:
     def __init__(self):
         self._lock = threading.Lock()
         self._threads = {}
+        self._active_kinds = {}
+
+    def has_running(self, kind):
+        with self._lock:
+            return self._active_kinds.get(kind, 0) > 0
 
     def start(self, kind, fn, name=None):
+        with self._lock:
+            if self._active_kinds.get(kind, 0) > 0:
+                return {"id": None, "kind": kind, "status": "already_running",
+                        "message": "同类型任务正在执行中"}
+            self._active_kinds[kind] = self._active_kinds.get(kind, 0) + 1
         jid = uuid.uuid4().hex[:12]
         job = {"id": jid, "kind": kind, "status": "running", "started": config.now_ms(),
                "finished": None, "progress": 0.0, "message": "排队中…", "result": None,
@@ -54,6 +65,8 @@ class JobManager:
                             "result": {"error": str(e),
                                        "trace": traceback.format_exc()[-2000:]}})
             store.job_save(job)
+            with self._lock:
+                self._active_kinds[kind] = max(0, self._active_kinds.get(kind, 0) - 1)
 
         t = threading.Thread(target=worker, name="job-" + jid, daemon=True)
         with self._lock:
@@ -76,21 +89,33 @@ class Scheduler(threading.Thread):
         super().__init__(daemon=True, name="scheduler")
         self.manager = manager
         self.stop_flag = threading.Event()
-        self.last_check = 0
 
     def run(self):
         time.sleep(6)
-        self._first_run_catchup()
+        try:
+            self._startup_catchup()
+        except Exception as e:  # noqa: BLE001
+            print("[scheduler] 启动补跑异常:", e)
         while not self.stop_flag.is_set():
             try:
                 self._tick()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                print("[scheduler] tick 异常:", e)
             time.sleep(45)
 
-    def _first_run_catchup(self):
-        """首次启动：没有选股结果时自动补跑“选股→回测”，保证开箱即用。"""
+    # ------------------------------------------------------------------
+    def _startup_catchup(self):
+        """启动补跑：首次无结果 / 选股日期落后于最新交易日 / 周度任务逾期。"""
+        prov = provider_mod.create_provider("live")
+        try:
+            market_last = prov.today_str()
+        except Exception:  # noqa: BLE001
+            market_last = ""
+        params = config.load_params()
+
         picks = store.json_read(config.PICKS_PATH)
+        screen_date = (picks or {}).get("meta", {}).get("date") if picks else None
+
         if not picks or not picks.get("picks"):
             def first_run(rep):
                 res = jobs.run_screen(progress=rep, force=True)
@@ -100,25 +125,35 @@ class Scheduler(threading.Thread):
                 return {"picks": len(res.get("picks", [])),
                         "backtest_file": bt.get("report_path")}
             JOBS.start("首次自动选股+回测", first_run)
-        else:
-            last_bt = jobs.latest_backtest()
-            if not last_bt:
-                JOBS.start("首次自动回测", lambda rep: jobs.run_backtest(progress=rep))
-            else:
-                # 逾期补跑：距上次调优超过 8 天则启动时自动“回测+自调优”
-                logs = store.load_tuning_logs(1)
-                stale = True
-                if logs:
-                    try:
-                        import datetime
-                        last_at = datetime.datetime.strptime(logs[0]["at"][:10], "%Y-%m-%d")
-                        stale = (datetime.date.today() - last_at.date()).days >= 8
-                    except Exception:
-                        stale = True
-                if stale:
-                    JOBS.start("启动补跑：周度回测+自调优",
-                               lambda rep: _weekly_cycle(rep))
+            return
 
+        # 选股日期落后于最新可交易日 → 立即补跑当天选股
+        if market_last and screen_date and screen_date < market_last:
+            def catchup_screen(rep):
+                res = jobs.run_screen(progress=rep, force=True)
+                d = (res.get("meta") or {}).get("date")
+                if d:
+                    store.meta_set("sched:screen:" + d, "1")
+                return res
+            JOBS.start("启动补跑每日选股", catchup_screen)
+
+        # 周度自调优逾期补跑
+        last_bt = jobs.latest_backtest()
+        logs = store.load_tuning_logs(1)
+        weekly_due = False
+        if logs:
+            try:
+                last_at = datetime.datetime.strptime(logs[0]["at"][:10], "%Y-%m-%d")
+                weekly_due = (datetime.date.today() - last_at.date()).days >= 8
+            except Exception:
+                weekly_due = True
+        elif not last_bt:
+            weekly_due = True
+        if weekly_due:
+            JOBS.start("启动补跑：周度回测+自调优",
+                       lambda rep: _weekly_cycle(rep))
+
+    # ------------------------------------------------------------------
     def _tick(self):
         params = config.load_params()
         sc = params["schedule"]
@@ -127,17 +162,17 @@ class Scheduler(threading.Thread):
         hm = "%02d:%02d" % (now.tm_hour, now.tm_min)
         today = time.strftime("%Y-%m-%d")
 
-        # 每日收盘后选股
-        if wd in sc.get("screen_weekdays", []) and hm >= sc.get("screen_hhmm", "18:10"):
+        # 交易日收盘后自动选股（默认 15:20 后；一周一次以上）
+        if wd in sc.get("screen_weekdays", []) and hm >= sc.get("screen_hhmm", "15:20"):
             key = "sched:screen:" + today
-            if store.meta_get(key, "") != "1":
+            if store.meta_get(key, "") != "1" and not JOBS.has_running("refresh_screen"):
                 store.meta_set(key, "1")
                 JOBS.start("定时每日选股", lambda rep: jobs.run_screen(progress=rep))
 
         # 每周固定时刻自动回测 + 自调优
         if wd in sc.get("backtest_weekdays", [4]) and hm >= sc.get("backtest_hhmm", "20:30"):
             key = "sched:weekly:" + today
-            if store.meta_get(key, "") != "1":
+            if store.meta_get(key, "") != "1" and not JOBS.has_running("tune"):
                 store.meta_set(key, "1")
                 JOBS.start("定时每周回测+自调优", lambda rep: _weekly_cycle(rep))
 
@@ -148,6 +183,7 @@ def _weekly_cycle(rep):
     rep("调优结束，重跑全样本回测存档…", 0.85)
     bt = jobs.run_backtest(progress=rep)
     rep("每周维护完成", 1.0)
+    store.meta_set("sched:weekly:" + time.strftime("%Y-%m-%d"), "1")
     return {"tune": tune_res, "backtest_file": bt.get("report_path")}
 
 
@@ -243,6 +279,34 @@ def api_status(h, path, q):
     bt = jobs.latest_backtest()
     paper = jobs.summarize_paper()
     from .strategy import params as pp
+
+    # ---- 市场/交易日状态：解释“为什么显示某个日期” ----
+    wk = ["一", "二", "三", "四", "五", "六", "日"]
+    now = datetime.datetime.now()
+    wd = now.weekday()
+    sc = params.get("schedule", {})
+    trading_wd = sc.get("screen_weekdays", [0, 1, 2, 3, 4])
+    hm = now.strftime("%H:%M")
+    hhmm = sc.get("screen_hhmm", "15:20")
+    market_last = ""
+    try:
+        market_last = prov.today_str()
+    except Exception:  # noqa: BLE001
+        pass
+    screen_date = (picks or {}).get("meta", {}).get("date") if picks else None
+    outdated = bool(market_last and screen_date and screen_date < market_last)
+
+    # 下一个自动选股时间
+    d = now.date()
+    nxt = None
+    for i in range(1, 8):
+        dd = d + datetime.timedelta(days=i)
+        if dd.weekday() in trading_wd:
+            nxt = "%s(周%s) %s" % (dd.isoformat(), wk[dd.weekday()], hhmm)
+            break
+    if wd in trading_wd and hm < hhmm:
+        nxt = "今日 %s" % hhmm
+
     h._send_json({
         "server_time": config.now_str(),
         "data_source": prov.mode, "data_source_label": prov.label,
@@ -250,8 +314,21 @@ def api_status(h, path, q):
             "version": params.get("version"), "tuned_at": params.get("tuned_at"),
             "summary": pp.param_summary(params),
         },
+        "market": {
+            "today": "%s (周%s)" % (d.isoformat(), wk[wd]),
+            "last_market_date": market_last or None,
+            "is_trading_day": wd in trading_wd,
+            "screen_date": screen_date,
+            "outdated": outdated,
+            "daily_auto_at": hhmm,
+            "next_auto_at": nxt,
+            "note": ("休市日：周末/节假日不产生新行情，页面显示最近交易日的收盘选股结果"
+                     if wd >= 5 else
+                     "已是最新交易日数据" if not outdated and market_last else
+                     "检测到更新交易日行情，将自动/已开始补跑选股"),
+        },
         "last_screen": store.meta_get("last_screen_at") or None,
-        "screen_date": (picks or {}).get("meta", {}).get("date") if picks else None,
+        "screen_date": screen_date,
         "picks_count": len((picks or {}).get("picks") or []) if picks else 0,
         "backtest": {
             "period": (bt or {}).get("period"), "n_trades": ((bt or {}).get("stats") or {}).get("n_trades"),
@@ -260,7 +337,7 @@ def api_status(h, path, q):
         } if bt else None,
         "paper": paper.get("stats"),
         "jobs": JOBS.status(),
-        "scheduler": "运行中（交易日收盘后选股；每周自动回测+自调优）",
+        "scheduler": "运行中（交易日收盘后自动选股；每周自动回测+自调优）",
         "settings": settings,
     })
 
