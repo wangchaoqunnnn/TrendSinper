@@ -83,18 +83,27 @@ DEFAULT_PARAMS = {
     "source": "依据《趋势策略.md》手工初值",
     "tuned_at": None,
     "screen": {
-        # 第一步“自上而下/第三步技术面”之外的硬性流动性过滤
+        # 全市场全量监控：沪主板 / 深主板 / 创业板 / 科创板 / 北证
         "top_n": 8,                 # 每次入选只数
         "min_price": 3.5,           # 低价股过滤（元）
         "max_price": 300.0,
-        "min_float_mv": 20.0,       # 流通市值下限（亿元）—— 可容纳北证小票
-        "max_float_mv": 2000.0,     # 流通市值上限（亿元）—— 大蓝筹弹性弱
+        "min_float_mv": 20.0,       # 流通市值下限（亿元，默认值）
+        "max_float_mv": 2000.0,     # 流通市值上限（亿元，默认值）
+        # 按板块差异化流动性门槛：北交所/科创板/创业板体量普遍较小，
+        # 使用统一 20 亿会把整个北交所排除在外 → 分别设置合理下限
+        "min_float_mv_by_board": {"北证": 2.0, "科创板": 8.0, "创业板": 10.0},
+        "max_float_mv_by_board": {"北证": 500.0},
         "exclude_st": True,
         "exclude_nearly_limit_up": True,   # 当日接近涨停不可追
         "min_score": 60.0,          # 加权总分门槛
         "min_history_days": 130,    # 至少要有 120 日线可用
         "auto_relax": True,         # 无人达标时自动放松门槛，保证可操作性
-        "max_per_board_ratio": 0.5, # 单一板块入选占比上限
+        "max_per_board_ratio": 0.5,  # 单一板块入选占比上限
+        "ensure_board_coverage": True,  # 板块保底：有达标票的交易所至少入选1只
+        "max_kline_fetch": 0,       # 0 = 全量参与，不抽样（不遗漏任何交易所）
+        "per_industry": 0,          # 仅在设置了 max_kline_fetch 时生效
+        "fetch_workers": 16,        # K线并发数（全量更新提速）
+        "comment": "覆盖全部A股：沪主板/深主板/创业板/科创板/北证",
     },
     "rules": {
         "ma_bull": {

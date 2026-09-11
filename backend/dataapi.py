@@ -25,24 +25,31 @@ CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
 
 
-def _http_text(url, timeout=10, retries=2, headers=None):
+def _http_text(url, timeout=10, retries=2, headers=None, hosts=None):
+    """GET 文本；hosts 为主机回退列表（东财 anti-bot 时切换镜像），带指数退避重试。"""
     last = None
-    for i in range(retries + 1):
-        try:
-            hdr = dict(UA)
-            if headers:
-                hdr.update(headers)
-            req = urllib.request.Request(url, headers=hdr)
-            with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
-                return r.read().decode("utf-8", errors="replace")
-        except Exception as e:  # noqa: BLE001
-            last = e
-            time.sleep(0.35 * (i + 1))
+    for host in (hosts or [None]):
+        target = url if host is None else host + url[url.index("/api"):]
+        for i in range(retries + 1):
+            try:
+                hdr = dict(UA)
+                if headers:
+                    hdr.update(headers)
+                req = urllib.request.Request(target, headers=hdr)
+                with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
+                    return r.read().decode("utf-8", errors="replace")
+            except Exception as e:  # noqa: BLE001
+                last = e
+                code = getattr(e, "code", None)
+                # 456/403/501 多为限流，退避更久一些
+                wait = (1.5 * (i + 1)) if code in (456, 403, 501, 429) else (0.35 * (i + 1))
+                time.sleep(wait)
     raise last
 
 
-def _http_json(url, timeout=10, retries=2, headers=None):
-    return json.loads(_http_text(url, timeout=timeout, retries=retries, headers=headers))
+def _http_json(url, timeout=10, retries=2, headers=None, hosts=None):
+    return json.loads(_http_text(url, timeout=timeout, retries=retries,
+                                 headers=headers, hosts=hosts))
 
 
 def _fnum(v):
@@ -55,8 +62,97 @@ def _fnum(v):
 
 
 # ---------------------------------------------------------------------------
-# 1) 全市场快照（新浪财经 hs_a，覆盖沪深主板/创业板/科创板/北证）
+# 1) 全市场快照
+#    主源：东方财富按交易所分段全量（沪主板/深主板/创业板/科创板/北证，共 5900+ 只，
+#          含行业、主力资金、停牌标的，不遗漏任何交易所）
+#    备源：新浪 hs_a 节点
 # ---------------------------------------------------------------------------
+_EM_SEGMENTS = [
+    ("沪主板", "m:1+t:2"),
+    ("深主板", "m:0+t:6"),
+    ("创业板", "m:0+t:80"),
+    ("科创板", "m:1+t:23"),
+    ("北证", "m:0+t:81+s:2048"),
+]
+_SNAP_FIELDS = "f12,f14,f2,f3,f5,f6,f8,f9,f10,f15,f16,f18,f20,f21,f23,f62,f100,f184"
+
+
+def _em_segment(seg_fs, pn, pz=100):
+    q = urllib.parse.urlencode({
+        "pn": pn, "pz": pz, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+        "fid": "f12", "fs": seg_fs, "fields": _SNAP_FIELDS,
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281"})
+    j = _http_json("https://push2.eastmoney.com/api/qt/clist/get?" + q,
+                   retries=1,
+                   hosts=["https://push2delay.eastmoney.com",
+                          "https://push2.eastmoney.com"])
+    return (j or {}).get("data") or {}
+
+
+def _em_segment_all(seg_fs, max_pages=40):
+    """抓取单个交易所分段的全部标的（该接口每页实际 100 条）。"""
+    rows = []
+    pn = 1
+    while pn <= max_pages:
+        data = _em_segment(seg_fs, pn)
+        diff = data.get("diff") or []
+        if not diff:
+            break
+        rows.extend(diff)
+        total = data.get("total") or 0
+        if pn * 100 >= total:
+            break
+        pn += 1
+    return rows
+
+
+def _em_row(d):
+    """东方财富快照行 → 统一结构（停牌标的保留并标记 suspended）。"""
+    price = _fnum(d.get("f2"))
+    prev = _fnum(d.get("f18"))
+    suspended = price is None or price <= 0
+    pct = _fnum(d.get("f3"))
+    total_mv = _fnum(d.get("f20"))
+    float_mv = _fnum(d.get("f21"))
+    return {
+        "code": str(d.get("f12")), "name": str(d.get("f14") or d.get("f12")),
+        "price": None if suspended else price,
+        "pct": None if suspended else (pct if pct is not None else None),
+        "vol": _fnum(d.get("f5")), "amount": _fnum(d.get("f6")),
+        "turnover": _fnum(d.get("f8")), "pe": _fnum(d.get("f9")),
+        "vol_ratio": _fnum(d.get("f10")),
+        "high": _fnum(d.get("f15")), "low": _fnum(d.get("f16")),
+        "prev_close": prev,
+        "total_mv": total_mv, "float_mv": float_mv, "pb": _fnum(d.get("f23")),
+        "main_inflow": _fnum(d.get("f62")),
+        "industry": d.get("f100") or "其他",
+        "main_inflow_pct": _fnum(d.get("f184")),
+        "suspended": suspended,
+    }
+
+
+def fetch_snapshot():
+    """全市场快照（沪主板/深主板/创业板/科创板/北证全量）→ list[dict]。"""
+    try:
+        res = parallel(_EM_SEGMENTS, lambda s: _em_segment_all(s[1]), workers=5)
+        out = []
+        seen = set()
+        for i, (name, _fs) in enumerate(_EM_SEGMENTS):
+            rows = res[i] or []
+            for d in rows:
+                r = _em_row(d)
+                if not r["code"] or r["code"] in seen:
+                    continue
+                seen.add(r["code"])
+                out.append(r)
+        if len(out) >= 4000:          # 覆盖完整才算成功
+            return out
+    except Exception:  # noqa: BLE001
+        pass
+    return fetch_snapshot_sina()
+
+
+# ------------------------------ 备源：新浪 ------------------------------
 _SINA_NODE = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
               "Market_Center.getHQNodeData")
 
@@ -75,8 +171,8 @@ def _sina_page(node, page, num=100):
     return json.loads(txt or "[]")
 
 
-def fetch_snapshot():
-    """新浪全市场快照（并行翻页）→ list[dict]。市值单位统一为“元”。"""
+def fetch_snapshot_sina():
+    """新浪全市场快照（并行翻页）→ list[dict]（备源，不含停牌标的）。"""
     first = _sina_page("hs_a", 1)
     if not isinstance(first, list):
         raise RuntimeError("新浪快照返回异常")
@@ -135,6 +231,7 @@ def fetch_snapshot():
             "float_mv": (nmc_wan * 1e4) if nmc_wan else None,
             "pb": _fnum(d.get("pb")),
             "industry": "其他", "main_inflow_pct": None, "main_inflow": None,
+            "suspended": False,
         })
     return out
 
@@ -378,7 +475,10 @@ def fetch_quotes(codes):
                     "pct": (price / prev - 1.0) if prev else 0.0,
                     "high": _fnum(parts[33]), "low": _fnum(parts[34]),
                     "open": _fnum(parts[5]),
+                    "vol": _fnum(parts[6]),                       # 成交量(手)
+                    "amount": (_fnum(parts[37]) or 0) * 10000.0,  # 成交额(万元→元)
                     "ts": parts[30] if len(parts) > 30 else "",
+                    "date": (parts[30][:8] if len(parts) > 30 and len(parts[30]) >= 8 else ""),
                 }
         except Exception:  # noqa: BLE001
             continue

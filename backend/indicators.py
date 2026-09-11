@@ -15,32 +15,28 @@ def sma(values, n):
     return out
 
 
-def rolling_max(values, n):
+def _rolling(values, n, is_max=True):
+    """单调队列实现的滑动极值 O(n)，返回与输入等长列表（前 n-1 个为 None）。"""
+    from collections import deque
     out = [None] * len(values)
-    mx = None
+    dq = deque()     # 存下标，值单调递减(求max) / 递增(求min)
     for i, v in enumerate(values):
-        if mx is None or i >= n:
-            if i >= n:
-                mx = max(values[i - n + 1:i + 1])
-            else:
-                mx = v
-        mx = max(mx, v)
-        out[i] = mx if i >= n - 1 else None
+        while dq and ((values[dq[-1]] <= v) if is_max else (values[dq[-1]] >= v)):
+            dq.pop()
+        dq.append(i)
+        if dq[0] <= i - n:
+            dq.popleft()
+        if i >= n - 1:
+            out[i] = values[dq[0]]
     return out
+
+
+def rolling_max(values, n):
+    return _rolling(values, n, True)
 
 
 def rolling_min(values, n):
-    out = [None] * len(values)
-    mn = None
-    for i, v in enumerate(values):
-        if mn is None or i >= n:
-            if i >= n:
-                mn = min(values[i - n + 1:i + 1])
-            else:
-                mn = v
-        mn = min(mn, v)
-        out[i] = mn if i >= n - 1 else None
-    return out
+    return _rolling(values, n, False)
 
 
 def pct_change(values, n):

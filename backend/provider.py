@@ -16,10 +16,11 @@ from .config import classify_board
 
 
 def _norm_meta(row):
-    """把快照行规整为引擎统一字段。"""
+    """把快照行规整为引擎统一字段（停牌标的保留并标记 suspended）。"""
     _, board = classify_board(row["code"])
     float_mv = row.get("float_mv")
     price = row.get("price") or 0.0
+    suspended = bool(row.get("suspended")) or price <= 0
     return {
         "code": row["code"], "name": row.get("name") or row["code"],
         "board": board, "industry": row.get("industry") or "其他",
@@ -29,6 +30,7 @@ def _norm_meta(row):
         "total_mv": row.get("total_mv"), "float_mv": float_mv,
         "main_inflow_pct": row.get("main_inflow_pct"),
         "prev_close": row.get("prev_close"), "high": row.get("high"), "low": row.get("low"),
+        "suspended": suspended,
         "is_st": bool(row.get("is_st")) or "ST" in str(row.get("name") or "").upper(),
         "is_leader": bool(row.get("is_leader", False)),
         "shares_float": (float_mv / price) if (float_mv and price) else None,
@@ -97,35 +99,42 @@ class LiveProvider:
     # 个股日K（SQLite 持久化缓存 + 按交易日增量更新）
     # ------------------------------------------------------------------
     def bars(self, code, deep=False):
-        need = 620 if deep else 320
-        cached = store.get_bars(code, limit=900)
-        last_date = cached[-1]["date"] if cached else None
+        # 选股最少只需 130 根（MA120）；缓存约 290 根即可满足全部规则（含250日新高窗口）
+        need = 620 if deep else 130
+        limit = 900 if deep else 340
         market_last = self.today_str()
-        # 缓存已覆盖到最近交易日 → 直接返回；否则只增量拉取缺失区间
+        cached = store.get_bars(code, limit=limit)
+        last_date = cached[-1]["date"] if cached else None
         if last_date is None or last_date < market_last:
             if last_date:
                 try:
                     d = datetime.date.fromisoformat(last_date)
                     beg = (d + datetime.timedelta(days=1)).strftime("%Y%m%d")
                 except Exception:  # noqa: BLE001
-                    beg = "20230101" if deep else "20240601"
+                    beg = self._default_beg(deep)
             else:
-                beg = "20230101" if deep else "20240601"
+                beg = self._default_beg(deep)
             try:
-                rows = dataapi.fetch_bars(code, beg=beg)
+                rows = dataapi.fetch_bars(code, beg=beg, count=(620 if deep else 320))
                 store.upsert_bars(code, rows)
-                cached = store.get_bars(code, limit=900)
+                cached = store.get_bars(code, limit=limit)
             except Exception:  # noqa: BLE001
                 pass
         if len(cached) >= need:
             return cached
         # 历史不足（新上市等）则拉全量补齐
         try:
-            rows = dataapi.fetch_bars(code, beg="20230101")
+            rows = dataapi.fetch_bars(code, beg=self._default_beg(True), count=620)
             store.upsert_bars(code, rows)
         except Exception:  # noqa: BLE001
             pass
-        return store.get_bars(code, limit=900)
+        return store.get_bars(code, limit=limit)
+
+    @staticmethod
+    def _default_beg(deep):
+        """选股约需 300 根K线（520 自然日），回测需要更长历史（900 自然日）。"""
+        days = 900 if deep else 520
+        return (datetime.date.today() - datetime.timedelta(days=days)).strftime("%Y%m%d")
 
     def codes_with_bars(self, min_bars=130):
         return store.codes_with_bars(min_bars)
@@ -160,6 +169,46 @@ class LiveProvider:
             self._index_cache[key] = rows
             self._index_ts[key] = now
         return rows
+
+    # ------------------------------------------------------------------
+    # 批量同步“当日K线”（腾讯行情 60 只/请求，用于把每日全量更新从数千次
+    # 单票K线请求降到约百次，显著降低延迟与被限流风险）
+    # ------------------------------------------------------------------
+    def sync_today_bars(self, codes, market_date, progress=None):
+        """codes: 候选代码；market_date: YYYY-MM-DD（最新交易日）。返回统计。"""
+        if not codes or not market_date:
+            return {"checked": 0, "updated": 0}
+        ymd = market_date.replace("-", "")
+        updated = 0
+        checked = 0
+        chunk = 60
+        total = len(codes)
+        for i in range(0, total, chunk):
+            part = codes[i:i + chunk]
+            try:
+                quotes = dataapi.fetch_quotes(part)
+            except Exception:  # noqa: BLE001
+                quotes = {}
+            items = []
+            for code, q in quotes.items():
+                checked += 1
+                if q.get("date") != ymd:
+                    continue
+                o, h, l, c = q.get("open"), q.get("high"), q.get("low"), q.get("price")
+                if not all([o, h, l, c]):
+                    continue
+                items.append((code, market_date, o, h, l, c,
+                              q.get("vol") or 0.0, q.get("amount") or 0.0))
+                updated += 1
+            if items:
+                store.upsert_bars_multi(items)
+            if progress and (i // chunk) % 4 == 0:
+                progress("批量同步当日K线 %d/%d（腾讯批量行情）" % (
+                    min(i + chunk, total), total), None)
+            with self._lock:
+                self._quotes = quotes
+                self._quotes_ts = time.time()
+        return {"checked": checked, "updated": updated}
 
     # ------------------------------------------------------------------
     # 基本面（东方财富最新报告期）

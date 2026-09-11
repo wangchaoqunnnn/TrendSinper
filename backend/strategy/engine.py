@@ -25,6 +25,11 @@ def build_arrays(bars, shares_float=None):
     l = [b["l"] for b in bars]
     c = [b["c"] for b in bars]
     v = [b["v"] or 0.0 for b in bars]
+    return build_arrays_lists(o, h, l, c, v, dates, shares_float)
+
+
+def build_arrays_lists(o, h, l, c, v, dates, shares_float=None):
+    """同 build_arrays，但直接接收序列（预热阶段复用，避免二次读库）。"""
     arr = {
         "dates": dates, "o": o, "h": h, "l": l, "c": c, "v": v,
         "ma20": ind.sma(c, 20), "ma60": ind.sma(c, 60), "ma120": ind.sma(c, 120),

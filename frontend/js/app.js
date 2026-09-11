@@ -190,6 +190,43 @@ async function loadPicks() {
   $("#picksList").innerHTML = picks.length
     ? picks.map(pickCard).join("")
     : `<div class="empty">${meta.empty ? meta.msg : "当前无满足条件的趋势票"}</div>`;
+  renderCoverage(meta);
+}
+
+/* 监控覆盖表：沪/深主板、创业板、科创板、北证全部扫描，无遗漏 */
+function renderCoverage(meta) {
+  const box = $("#coverageBox");
+  const cov = meta.coverage;
+  if (!cov) { box.innerHTML = ""; return; }
+  const order = ["沪主板", "深主板", "创业板", "科创板", "北证"];
+  const items = order.filter(b => cov[b]).map(b => Object.assign({ board: b }, cov[b]));
+  const total = meta.counts || {};
+  const passedSum = items.reduce((s, x) => s + (x.passed || 0), 0);
+  box.innerHTML = `<h3>监控覆盖 · 全市场全量（点击表头排序）</h3>
+    <div class="meta-line">${esc(meta.universe_policy || "覆盖沪主板/深主板/创业板/科创板/北证")}
+      ｜上市股票 <b>${total.universe || 0}</b> 只（含停牌 ${total.suspended || 0}）
+      · 可交易候选 <b>${total.candidate || 0}</b>
+      · K线覆盖 <b>${total.with_kline || 0}</b>
+      · 达标 <b>${passedSum}</b>
+      · 入选 <b>${total.picked || 0}</b></div>
+    <div id="coverageTable"></div>`;
+  makeSortableTable($("#coverageTable"), [
+    { key: "board", label: "交易所/板块" },
+    { key: "universe", label: "上市数", num: true },
+    { key: "suspended", label: "停牌", num: true },
+    { key: "candidate", label: "可交易候选", num: true },
+    { key: "with_kline", label: "K线覆盖", num: true },
+    { key: "passed", label: "达标", num: true },
+    { key: "picked", label: "入选", num: true },
+  ], items, it => [
+    esc(it.board),
+    `<span class="num">${it.universe || 0}</span>`,
+    `<span class="num">${it.suspended || 0}</span>`,
+    `<span class="num">${it.candidate || 0}</span>`,
+    `<span class="num">${it.with_kline || 0}</span>`,
+    `<span class="num">${it.passed || 0}</span>`,
+    `<span class="num">${it.picked || 0}</span>`,
+  ]);
 }
 
 function pickCard(p) {

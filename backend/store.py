@@ -101,6 +101,20 @@ def bar_count(code):
         conn.close()
 
 
+def upsert_bars_multi(items):
+    """items: list[(code, date, o, h, l, c, v, amount)]，单连接批量写入。"""
+    if not items:
+        return
+    conn = connect()
+    try:
+        conn.executemany(
+            "INSERT OR REPLACE INTO bars(code,date,o,h,l,c,v,amount) VALUES(?,?,?,?,?,?,?,?)",
+            items)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def codes_with_bars(min_bars=130):
     conn = connect()
     try:

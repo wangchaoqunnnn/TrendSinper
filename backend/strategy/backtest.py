@@ -41,10 +41,20 @@ class Backtester:
         metas = self.provider.universe_cached()
         if not metas:
             metas = self.provider.snapshot()
+        sc = config.load_params()["screen"]
+        lo_map = sc.get("min_float_mv_by_board", {})
+        hi_map = sc.get("max_float_mv_by_board", {})
+
+        def mv_ok(m):
+            fmv = m.get("float_mv")
+            if not fmv:
+                return False
+            lo = lo_map.get(m["board"], sc["min_float_mv"]) * 1e8
+            hi = hi_map.get(m["board"], sc["max_float_mv"]) * 1e8
+            return lo <= fmv <= hi
+
         keep = [m for m in metas
-                if not m.get("is_st") and (m.get("price") or 0) >= 3.0
-                and m.get("float_mv") is not None
-                and 15e8 <= m["float_mv"] <= 2500e8]
+                if not m.get("is_st") and (m.get("price") or 0) >= 3.0 and mv_ok(m)]
         by_ind = {}
         for m in keep:
             by_ind.setdefault(m["industry"], []).append(m)

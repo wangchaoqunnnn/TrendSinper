@@ -1,18 +1,33 @@
 # -*- coding: utf-8 -*-
-"""选股流程（screen）：实时最新一次信号日执行“选股”。
+"""选股流程（screen）：对全市场（沪主板/深主板/创业板/科创板/北证）全量扫描。
 
-流程：快照硬过滤 → 限量拉取日K（并行） → 行业/大盘上下文 → 全维度打分排序
-→ 板块均衡 → 门槛不足自动放宽 → 生成推荐理由与止损价。
+流程：
+  1) 全市场快照（东方财富分交易所全量 5900+ 只，含停牌标的）
+  2) 可交易性硬过滤（价格/市值/ST/涨跌停/停牌）→ 候选（默认全量参与，不抽样）
+  3) 并行预热并增量更新日K（SQLite 缓存，只补缺失交易日）
+  4) 计算行业景气（板块内站上MA60比例与20日涨幅）
+  5) 全维度打分（两遍式：先算分排序，再为入选票生成完整理由，内存占用低）
+  6) 板块保底 + 单板块上限 + 门槛自动放宽 → 输出推荐（理由 + 止损价）
 """
+from array import array
+from collections import Counter
 import random
 
 from .. import config
 from . import engine
 
 
+def empty_coverage():
+    return {b: {"universe": 0, "suspended": 0, "candidate": 0,
+                "with_kline": 0, "passed": 0, "picked": 0}
+            for b in config.BOARDS}
+
+
 def _meta_ok(meta, p):
-    """硬性流动性与标的过滤（对应策略第三步前的可交易性约束）。"""
+    """硬性可交易性过滤。"""
     sc = p["screen"]
+    if meta.get("suspended"):
+        return False
     if meta["is_st"] and sc["exclude_st"]:
         return False
     price = meta["price"]
@@ -22,43 +37,46 @@ def _meta_ok(meta, p):
         return False
     fmv = meta.get("float_mv")
     if fmv:
-        if not (sc["min_float_mv"] <= fmv / 1e8 <= sc["max_float_mv"]):
+        lo = sc.get("min_float_mv_by_board", {}).get(meta["board"], sc["min_float_mv"])
+        hi = sc.get("max_float_mv_by_board", {}).get(meta["board"], sc["max_float_mv"])
+        if not (lo <= fmv / 1e8 <= hi):
             return False
-    # 排除当日已接近涨停（次日难以按信号价买入）与跌停/停牌
     if sc.get("exclude_nearly_limit_up", True):
         lim = config.limit_up_pct(meta["board"])
         pct = (meta.get("pct") or 0.0) / 100.0
         if pct >= lim * 0.95 or pct <= -lim * 0.95:
             return False
-    if meta.get("name") and (meta["name"].startswith("N") or meta["name"].startswith("C")):
-        return False  # 新股/次新上市初期无足够历史
+    name = meta.get("name") or ""
+    if name.startswith("N") or name.startswith("C"):
+        return False      # 新股/次新上市初期无足够历史
     return True
 
 
-def _prefilter(meta_list, p, max_fetch=900, per_industry=30):
-    """按可交易性粗筛，并按行业限量抽样（兼顾板块宽度与拉取预算）。"""
+def _prefilter(meta_list, p):
+    """返回全部通过硬过滤的候选（默认不设上限；配置了上限时才按行业均匀取样）。"""
+    sc = p["screen"]
     keep = [m for m in meta_list if _meta_ok(m, p)]
-    by_ind = {}
-    for m in keep:
-        by_ind.setdefault(m["industry"], []).append(m)
-    chosen = []
-    inds = sorted(by_ind.keys())
-    # 确定性打散，避免行业排序偏差
-    rnd = random.Random(20240905)
-    rnd.shuffle(inds)
-    for ind in inds:
-        members = by_ind[ind]
-        rnd.shuffle(members)
-        chosen.extend(members[:per_industry])
-    rnd.shuffle(chosen)
-    return chosen[:max_fetch]
+    max_fetch = int(sc.get("max_kline_fetch", 0) or 0)
+    if max_fetch and len(keep) > max_fetch:
+        per_industry = int(sc.get("per_industry", 30) or 30)
+        by_ind = {}
+        for m in keep:
+            by_ind.setdefault(m["industry"], []).append(m)
+        rnd = random.Random(20240905)
+        inds = sorted(by_ind.keys())
+        rnd.shuffle(inds)
+        chosen = []
+        for ind in inds:
+            members = by_ind[ind]
+            rnd.shuffle(members)
+            chosen.extend(members[:per_industry])
+        rnd.shuffle(chosen)
+        return chosen[:max_fetch]
+    return keep
 
 
 def compute_stop(entry_price, arr, t, params):
-    """止损价 = max(MA20×(1-2%), 近10日回调低点×(1-2%), 买入价×(1-止损%))。
-
-    取三者最高者：趋势未破坏就持有（顺势不动摇），关键支撑破位坚决离场（破位坚决跑）。
-    """
+    """止损价 = max(MA20×(1-2%), 近10日回调低点×(1-2%), 买入价×(1-止损%))。"""
     rk = params["risk"]
     floor_pct = rk.get("swing_floor_pct", 0.02)
     ma20 = arr["ma20"][t]
@@ -86,7 +104,6 @@ def _board_cap(p):
 
 def pick_payload(code, meta, arr, t, ctx, params, ev):
     """组装最终推荐对象（含理由、止损价、风险提示）。"""
-    sc = params["screen"]
     entry_price = round(arr["c"][t], 2)
     stop_price, stop_why = compute_stop(entry_price, arr, t, params)
     ma20 = arr["ma20"][t]
@@ -111,144 +128,214 @@ def pick_payload(code, meta, arr, t, ctx, params, ev):
     }
 
 
+def _select(scored, params, threshold, top_n):
+    """板块保底 + 单板块上限的选择。scored: [(score, code, meta, ev)] 降序。"""
+    cap = _board_cap(params)
+    picks = []
+    board_cnt = Counter()
+    covered = set()
+    if params["screen"].get("ensure_board_coverage", True):
+        for score, code, meta, ev in scored:
+            if score < threshold:
+                break
+            b = meta["board"]
+            if b in covered or board_cnt[b] >= cap:
+                continue
+            picks.append((score, code, meta, ev))
+            board_cnt[b] += 1
+            covered.add(b)
+            if len(picks) >= top_n:
+                return picks
+    chosen_codes = {p[1] for p in picks}
+    for score, code, meta, ev in scored:
+        if len(picks) >= top_n:
+            break
+        if score < threshold or code in chosen_codes:
+            continue
+        b = meta["board"]
+        if board_cnt[b] >= cap:
+            continue
+        picks.append((score, code, meta, ev))
+        board_cnt[b] += 1
+        chosen_codes.add(code)
+    return picks
+
+
 def screen(provider, params=None, progress=None, top_n=None):
-    """执行一次“今日选股”。progress(msg, frac) 可选。返回完整结果 dict。"""
+    """执行一次“今日选股”（全市场全量）。返回 {picks, meta, coverage}。"""
     params = params or config.load_params()
-    sc = params["screen"]
+    sc = dict(params["screen"])
+    if top_n:
+        sc["top_n"] = top_n
+    params = dict(params)
+    params["screen"] = sc
 
     def log(msg, frac=None):
         if progress:
             progress(msg, frac)
 
-    log("拉取全市场快照…", 0.02)
+    # ---- 1. 全市场快照 ----
+    log("拉取全市场快照（沪主板/深主板/创业板/科创板/北证）…", 0.02)
     meta_list = provider.snapshot()
     meta_by_code = {m["code"]: m for m in meta_list}
+    coverage = empty_coverage()
+    for m in meta_list:
+        c = coverage.setdefault(m["board"], {"universe": 0, "suspended": 0, "candidate": 0,
+                                             "with_kline": 0, "passed": 0, "picked": 0})
+        c["universe"] += 1
+        if m.get("suspended"):
+            c["suspended"] += 1
 
-    log("硬过滤并限量候选（预算 %d 只）…" % sc.get("max_kline_fetch", 900), 0.08)
-    cands = _prefilter(meta_list, params, max_fetch=sc.get("max_kline_fetch", 900),
-                       per_industry=sc.get("per_industry", 30))
+    # ---- 2. 全量候选（默认不抽样） ----
+    cands = _prefilter(meta_list, params)
+    for m in cands:
+        coverage[m["board"]]["candidate"] += 1
+    log("全市场 %d 只 → 可交易候选 %d 只（全量参与）" % (len(meta_list), len(cands)), 0.08)
 
-    # ---- 并行拉K线 ----
-    log("并行拉取 %d 只候选日K…" % len(cands), 0.12)
+    # ---- 3. 先用批量行情补齐“当日K线”（60只/请求，快速），再逐只兜底 ----
+    bench = provider.index_bars()
+    date = bench[-1]["date"] if bench else ""
+    log("批量同步当日K线（腾讯批量行情，%d 只）…" % len(cands), 0.09)
+    try:
+        provider.sync_today_bars([m["code"] for m in cands], date, progress=progress)
+    except Exception:  # noqa: BLE001
+        pass
+
+    from .. import dataapi
     total = len(cands)
     done = [0]
+    workers = int(sc.get("fetch_workers", 12) or 12)
 
-    def load(m):
+    def preload(m):
         bars = provider.bars(m["code"])
         done[0] += 1
-        if progress and done[0] % 50 == 0:
-            progress("拉取K线 %d/%d" % (done[0], total), 0.12 + 0.5 * done[0] / max(total, 1))
+        if progress and done[0] % 200 == 0:
+            progress("更新/校验K线 %d/%d" % (done[0], total),
+                     0.10 + 0.55 * done[0] / max(total, 1))
         if len(bars) < sc["min_history_days"]:
             return None
-        return engine.build_arrays(bars, shares_float=m.get("shares_float"))
+        seg = bars[-340:]
+        closes = [b["c"] for b in seg]
+        n = len(closes)
+        if n < 61:
+            return None
+        ma60 = sum(closes[-60:]) / 60.0
+        ret20 = closes[-1] / closes[-21] - 1.0 if n >= 21 else 0.0
+        # 紧凑数组缓存（array('d') 内存友好），供打分/理由阶段直接复用，免二次读库
+        return {
+            "above": closes[-1] > ma60, "ret20": ret20, "last": seg[-1]["date"],
+            "o": array("d", [b["o"] for b in seg]),
+            "h": array("d", [b["h"] for b in seg]),
+            "l": array("d", [b["l"] for b in seg]),
+            "c": array("d", closes),
+            "v": array("d", [b["v"] or 0.0 for b in seg]),
+        }
 
-    arrs = {}
-    from .. import dataapi
-    results = dataapi.parallel(cands, load, workers=10)
+    metrics = dataapi.parallel(cands, preload, workers=workers)
+    ok_codes = []
+    recs = {}
     for i, m in enumerate(cands):
-        a = results[i]
-        if a is not None:
-            arrs[m["code"]] = a
+        mt = metrics[i]
+        if mt is None:
+            continue
+        coverage[m["board"]]["with_kline"] += 1
+        ok_codes.append(m["code"])
+        recs[m["code"]] = mt
+    log("K线就绪 %d/%d 只" % (len(ok_codes), total), 0.66)
+    if not ok_codes:
+        return {"picks": [], "coverage": coverage,
+                "meta": {"error": "无足够K线数据（数据源异常？）"}}
 
-    if not arrs:
-        return {"picks": [], "meta": {"error": "无足够K线数据的候选（数据源异常？）"}}
-
-    # 信号日 = 全市场共同的最新交易日；剔除长期停牌（最后K线早于大盘）的标的
-    from collections import Counter
-    last_dates = Counter(a["dates"][-1] for a in arrs.values())
-    market_date = last_dates.most_common(1)[0][0]
-    arrs = {code: a for code, a in arrs.items() if a["dates"][-1] == market_date}
-    log("K线就绪 %d 只（信号日 %s）" % (len(arrs), market_date), 0.62)
-    if not arrs:
-        return {"picks": [], "meta": {"error": "无交易日对齐的候选"}}
-
-    # ---- 上下文：大盘 + 行业景气 + 基本面 ----
-    idx = len(next(iter(arrs.values()))["dates"]) - 1
-    date = market_date
-    log("构建行业景气与大盘上下文…", 0.68)
-    bench = provider.index_bars()
-    bench_closes = [b["c"] for b in bench]
-    bench_pos = None
-    for i in range(len(bench) - 1, -1, -1):
-        if bench[i]["date"] <= date:
-            bench_pos = i
-            break
-
+    # ---- 4. 行业景气 + 大盘上下文 ----
+    log("构建行业景气与大盘上下文…", 0.70)
     sector = {}
-    for code, a in arrs.items():
-        m = meta_by_code.get(code)
-        i = len(a["dates"]) - 1
-        if m is None or i < 20 or a["ma60"][i] is None:
+    for i, m in enumerate(cands):
+        mt = metrics[i]
+        if mt is None:
             continue
         ind = m["industry"]
         s = sector.setdefault(ind, {"members": 0, "above": 0, "rets": []})
         s["members"] += 1
-        if a["c"][i] > a["ma60"][i]:
+        if mt["above"]:
             s["above"] += 1
-        s["rets"].append(a["c"][i] / a["c"][i - 20] - 1.0)
-    sector_stats = {}
-    for ind, s in sector.items():
-        sector_stats[ind] = {
-            "members": s["members"],
-            "above_frac": s["above"] / s["members"],
-            "ret20": sum(s["rets"]) / len(s["rets"]),
-        }
+        s["rets"].append(mt["ret20"])
+    sector_stats = {ind: {"members": s["members"],
+                          "above_frac": s["above"] / max(1, s["members"]),
+                          "ret20": sum(s["rets"]) / max(1, len(s["rets"]))}
+                    for ind, s in sector.items()}
 
+    bench_closes = [b["c"] for b in bench]
     ctx = engine.EngineCtx()
-    ctx.bench_ok = bench_pos is not None and bench_pos >= 21
+    ctx.bench_ok = len(bench) >= 22
     ctx.bench_closes = bench_closes
-    ctx.bench_pos = bench_pos
+    ctx.bench_pos = len(bench) - 1
     ctx.sector = sector_stats
     ctx.funds = provider.fundamentals()
     ctx.date = date
 
-    # ---- 打分排序 ----
-    log("全维度打分…", 0.8)
+    # ---- 5. 全维度打分（第一遍：只算分） ----
+    log("全维度打分（%d 只）…" % len(ok_codes), 0.75)
+    threshold = sc["min_score"]
     scored = []
-    for code, a in arrs.items():
+    n_ok = len(ok_codes)
+    for n_i, code in enumerate(ok_codes):
         m = meta_by_code.get(code)
-        i = len(a["dates"]) - 1          # 各自最后一个交易日（与信号日对齐）
-        if i < 120:                      # 均线数据不足的次新股跳过
+        rec = recs.get(code)
+        if rec is None:
             continue
-        ev = engine.evaluate(code, a, m, i, ctx, params, reasons=True)
-        scored.append((ev["score"], code, ev, a, m, i))
+        t = len(rec["c"]) - 1
+        if t < 120 or rec["last"] != date:
+            continue
+        dates = [None] * t + [rec["last"]]
+        arr = engine.build_arrays_lists(rec["o"], rec["h"], rec["l"], rec["c"],
+                                        rec["v"], dates, m.get("shares_float"))
+        ev = engine.evaluate(code, arr, m, t, ctx, params, reasons=False)
+        scored.append((ev["score"], code, m, ev))
+        if ev["score"] >= threshold:
+            coverage[m["board"]]["passed"] += 1
+        if progress and (n_i + 1) % 500 == 0:
+            progress("打分 %d/%d" % (n_i + 1, n_ok), 0.75 + 0.15 * (n_i + 1) / max(1, n_ok))
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # ---- 门槛 + 板块均衡 + 自动放宽 ----
-    threshold = sc["min_score"]
+    # ---- 6. 选择：板块保底 + 上限 + 门槛放宽 ----
+    picks = _select(scored, params, threshold, sc["top_n"])
     relaxed = False
     floor = max(35.0, sc["min_score"] - 25.0)
-    while True:
-        picks = []
-        board_cnt = {}
-        cap = _board_cap(params)
-        for score, code, ev, a, m, i in scored:
-            if score < threshold:
-                break
-            b = m["board"]
-            if board_cnt.get(b, 0) >= cap:
-                continue
-            board_cnt[b] = board_cnt.get(b, 0) + 1
-            picks.append((code, ev, a, m, i))
-            if len(picks) >= sc["top_n"]:
-                break
-        if len(picks) >= 3 or threshold <= floor or not sc["auto_relax"]:
-            break
+    while len(picks) < 3 and sc.get("auto_relax", True) and threshold > floor:
         threshold = round(threshold - 5.0, 1)
         relaxed = True
+        picks = _select(scored, params, threshold, sc["top_n"])
 
+    # ---- 7. 为入选票生成完整理由（第二遍，复用预热缓存） ----
     out_picks = []
-    for code, ev, a, m, i in picks:
-        out_picks.append(pick_payload(code, m, a, i, ctx, params, ev))
+    for score, code, m, ev in picks:
+        rec = recs.get(code)
+        if rec is None:
+            continue
+        t = len(rec["c"]) - 1
+        dates = [None] * t + [rec["last"]]
+        arr = engine.build_arrays_lists(rec["o"], rec["h"], rec["l"], rec["c"],
+                                        rec["v"], dates, m.get("shares_float"))
+        full = engine.evaluate(code, arr, m, t, ctx, params, reasons=True)
+        out_picks.append(pick_payload(code, m, arr, t, ctx, params, full))
+        coverage[m["board"]]["picked"] += 1
 
     meta_out = {
         "date": date, "provider": provider.mode, "provider_label": provider.label,
         "params_version": params.get("version"), "threshold": threshold,
-        "relaxed": relaxed, "relaxed_note": ("未达原始门槛(%.0f分)，已自动放宽至 %.0f 分" % (
+        "relaxed": relaxed,
+        "relaxed_note": ("未达原始门槛(%.0f分)，已自动放宽至 %.0f 分" % (
             sc["min_score"], threshold)) if relaxed else None,
         "counts": {
             "universe": len(meta_list), "candidate": len(cands),
-            "with_kline": len(arrs), "picked": len(out_picks),
+            "with_kline": len(ok_codes), "scored": len(scored),
+            "picked": len(out_picks),
+            "suspended": sum(c["suspended"] for c in coverage.values()),
         },
+        "coverage": coverage,
+        "boards": list(config.BOARDS),
+        "universe_policy": "全市场全量扫描（沪主板/深主板/创业板/科创板/北证），不抽样、不遗漏",
     }
-    return {"picks": out_picks, "meta": meta_out}
+    log("选股完成：全市场 %d 只，候选 %d，K线 %d，入选 %d 只（%s）" % (
+        len(meta_list), len(cands), len(ok_codes), len(out_picks), date), 1.0)
+    return {"picks": out_picks, "meta": meta_out, "coverage": coverage}
